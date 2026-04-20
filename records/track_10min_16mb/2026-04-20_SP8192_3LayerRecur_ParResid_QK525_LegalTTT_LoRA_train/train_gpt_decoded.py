@@ -25,6 +25,8 @@ from flash_attn_interface import flash_attn_func as flash_attn_3_func
 
 
 COMPILE_ENABLED_ENV = bool(int(os.environ.get("COMPILE_ENABLED", "1")))
+GPTQ_MIN_NUMEL = 65536
+LORA_GPTQ_MIN_NUMEL = 32768
 
 
 class Hyperparameters:
@@ -765,6 +767,14 @@ def get_lora_parameter_count(model: nn.Module) -> int:
     return sum(param.numel() for name, param in model.named_parameters() if "lora_" in name)
 
 
+def gptq_min_numel_for_name(name: str) -> int:
+    return LORA_GPTQ_MIN_NUMEL if "lora_" in name else GPTQ_MIN_NUMEL
+
+
+def should_gptq_named_tensor(name: str, tensor: Tensor) -> bool:
+    return tensor.is_floating_point() and tensor.numel() >= gptq_min_numel_for_name(name)
+
+
 def get_reconstructible_tensor_names(model: nn.Module) -> set[str]:
     names = set()
     for module_name, module in model.named_modules():
@@ -1023,22 +1033,44 @@ def collect_hessians(
     hessians = {}
     hooks = []
 
+    def flatten_input(x: Tensor) -> Tensor:
+        x = x.detach().float()
+        if x.ndim == 3:
+            x = x.reshape(-1, x.shape[-1])
+        return x
+
+    def add_hessian(name: str, x: Tensor) -> None:
+        if name not in hessians:
+            hessians[name] = torch.zeros(x.shape[1], x.shape[1], dtype=torch.float32, device=device)
+        hessians[name].addmm_(x.T, x)
+
     def make_hook(name: str):
         def hook_fn(module, inp, out):
-            x = inp[0].detach().float()
-            if x.ndim == 3:
-                x = x.reshape(-1, x.shape[-1])
-            if name not in hessians:
-                hessians[name] = torch.zeros(x.shape[1], x.shape[1], dtype=torch.float32, device=device)
-            hessians[name].addmm_(x.T, x)
+            add_hessian(name, flatten_input(inp[0]))
+
+        return hook_fn
+
+    def make_lora_hook(name: str, quantize_a: bool, quantize_b: bool):
+        def hook_fn(module, inp, out):
+            x = flatten_input(inp[0])
+            if quantize_a:
+                add_hessian(name + ".lora_A", x)
+            if quantize_b:
+                projected = F.linear(x, module.lora_A.detach().float(), bias=None)
+                add_hessian(name + ".lora_B", projected)
 
         return hook_fn
 
     for name, module in model.named_modules():
-        if isinstance(module, CastedLinear) and module.weight.numel() > 65536:
+        if isinstance(module, CastedLinear) and should_gptq_named_tensor(name + ".weight", module.weight):
             category = classify_param(name + ".weight")
             if category in ("mlp", "attn"):
                 hooks.append(module.register_forward_hook(make_hook(name + ".weight")))
+        elif isinstance(module, LoRALinear):
+            quantize_a = should_gptq_named_tensor(name + ".lora_A", module.lora_A)
+            quantize_b = should_gptq_named_tensor(name + ".lora_B", module.lora_B)
+            if quantize_a or quantize_b:
+                hooks.append(module.register_forward_hook(make_lora_hook(name, quantize_a, quantize_b)))
 
     if model.tie_embeddings:
         hook_module = model.head_proj if model.head_proj is not None else model.final_norm
@@ -1124,7 +1156,7 @@ def gptq_mixed_quantize(
             result[name] = t
             meta[name] = "passthrough"
             continue
-        if t.numel() <= 65536:
+        if t.numel() < gptq_min_numel_for_name(name):
             result[name] = t.to(torch.float16)
             meta[name] = "passthrough (float16)"
             continue
