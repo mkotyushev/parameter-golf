@@ -64,6 +64,7 @@ class Hyperparameters:
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 5.0))
     lora_rank = int(os.environ.get("LORA_RANK", 0))
+    lora_freeze_a = bool(int(os.environ.get("LORA_FREEZE_A", "0")))
     compile_enabled = bool(int(os.environ.get("COMPILE_ENABLED", "1")))
 
     num_loops = int(os.environ.get("NUM_LOOPS", 2))
@@ -326,7 +327,7 @@ class CastedLinear(nn.Linear):
 
 
 class LoRALinear(nn.Module):
-    def __init__(self, linear: CastedLinear, rank: int, generator: torch.Generator):
+    def __init__(self, linear: CastedLinear, rank: int, generator: torch.Generator, freeze_a: bool = False):
         super().__init__()
         if not isinstance(linear, nn.Linear):
             raise TypeError(f"Expected nn.Linear, got {type(linear).__name__}")
@@ -335,6 +336,7 @@ class LoRALinear(nn.Module):
         self.in_features = linear.in_features
         self.out_features = linear.out_features
         self.rank = rank
+        self.freeze_a = freeze_a
         self.scaling = 1.0
         self.weight = linear.weight
         self.bias = linear.bias
@@ -345,13 +347,16 @@ class LoRALinear(nn.Module):
         self.lora_B = nn.Parameter(self.weight.new_zeros((self.out_features, rank)))
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5), generator=generator)
         nn.init.zeros_(self.lora_B)
+        if self.freeze_a:
+            self.lora_A.requires_grad = False
 
     def extra_repr(self) -> str:
         return (
             f"in_features={self.in_features}, "
             f"out_features={self.out_features}, "
             f"bias={self.bias is not None}, "
-            f"rank={self.rank}"
+            f"rank={self.rank}, "
+            f"freeze_a={self.freeze_a}"
         )
 
     def fused_weight(self) -> Tensor:
@@ -704,14 +709,19 @@ def make_lora_generator(seed: int, device: torch.device) -> torch.Generator:
     return generator
 
 
-def replace_casted_linear_with_lora(module: nn.Module, rank: int, generator: torch.Generator) -> nn.Module:
+def replace_casted_linear_with_lora(
+    module: nn.Module,
+    rank: int,
+    generator: torch.Generator,
+    freeze_a: bool = False,
+) -> nn.Module:
     for name, child in list(module.named_children()):
         if isinstance(child, LoRALinear):
             continue
         if isinstance(child, CastedLinear):
-            setattr(module, name, LoRALinear(child, rank=rank, generator=generator))
+            setattr(module, name, LoRALinear(child, rank=rank, generator=generator, freeze_a=freeze_a))
             continue
-        replace_casted_linear_with_lora(child, rank=rank, generator=generator)
+        replace_casted_linear_with_lora(child, rank=rank, generator=generator, freeze_a=freeze_a)
     return module
 
 
@@ -736,9 +746,11 @@ def build_model(
     device: torch.device,
     init_seed: int | None = None,
     lora_rank: int | None = None,
+    lora_freeze_a: bool | None = None,
 ) -> GPT:
     init_seed = h.seed if init_seed is None else init_seed
     lora_rank = h.lora_rank if lora_rank is None else lora_rank
+    lora_freeze_a = h.lora_freeze_a if lora_freeze_a is None else lora_freeze_a
     rng_state = snapshot_rng_state()
     try:
         seed_all(init_seed)
@@ -746,7 +758,12 @@ def build_model(
         restore_fp32_params(model)
         if lora_rank > 0:
             lora_generator = make_lora_generator(init_seed + 1, device)
-            replace_casted_linear_with_lora(model, rank=lora_rank, generator=lora_generator)
+            replace_casted_linear_with_lora(
+                model,
+                rank=lora_rank,
+                generator=lora_generator,
+                freeze_a=lora_freeze_a,
+            )
         return model
     finally:
         restore_rng_state(rng_state)
@@ -761,6 +778,13 @@ def get_lora_rank(model: nn.Module) -> int:
         if isinstance(module, LoRALinear):
             return module.rank
     return 0
+
+
+def get_lora_freeze_a(model: nn.Module) -> bool:
+    freeze_settings = {module.freeze_a for module in model.modules() if isinstance(module, LoRALinear)}
+    if len(freeze_settings) > 1:
+        raise ValueError(f"Expected uniform LoRA freeze_a setting, got {sorted(freeze_settings)}")
+    return next(iter(freeze_settings), False)
 
 
 def get_lora_parameter_count(model: nn.Module) -> int:
@@ -784,6 +808,8 @@ def get_reconstructible_tensor_names(model: nn.Module) -> set[str]:
         names.add(f"{prefix}weight")
         if module.bias is not None:
             names.add(f"{prefix}bias")
+        if module.freeze_a:
+            names.add(f"{prefix}lora_A")
     return names
 
 
@@ -1067,7 +1093,7 @@ def collect_hessians(
             if category in ("mlp", "attn"):
                 hooks.append(module.register_forward_hook(make_hook(name + ".weight")))
         elif isinstance(module, LoRALinear):
-            quantize_a = should_gptq_named_tensor(name + ".lora_A", module.lora_A)
+            quantize_a = not module.freeze_a and should_gptq_named_tensor(name + ".lora_A", module.lora_A)
             quantize_b = should_gptq_named_tensor(name + ".lora_B", module.lora_B)
             if quantize_a or quantize_b:
                 hooks.append(module.register_forward_hook(make_lora_hook(name, quantize_a, quantize_b)))
@@ -1272,10 +1298,12 @@ def _decompress(data: bytes, compressor: str) -> bytes:
 def build_artifact_meta(h: Hyperparameters, model: nn.Module) -> dict[str, object]:
     artifact_mode = "lora" if has_lora_layers(model) else "full"
     lora_rank = get_lora_rank(model) if artifact_mode == "lora" else 0
+    lora_freeze_a = get_lora_freeze_a(model) if artifact_mode == "lora" else False
     return {
         "artifact_mode": artifact_mode,
         "init_seed": h.seed,
         "lora_rank": lora_rank,
+        "lora_freeze_a": lora_freeze_a,
     }
 
 
@@ -1332,24 +1360,34 @@ def _resolve_artifact_meta(h: Hyperparameters, quant_state: dict[str, object]) -
             "artifact_mode": "full",
             "init_seed": h.seed,
             "lora_rank": 0,
+            "lora_freeze_a": False,
         }
     artifact_mode = artifact_meta.get("artifact_mode", "full")
     init_seed = int(artifact_meta.get("init_seed", h.seed))
     lora_rank = int(artifact_meta.get("lora_rank", 0))
+    lora_freeze_a = bool(artifact_meta.get("lora_freeze_a", False))
     if artifact_mode not in {"full", "lora"}:
         raise ValueError(f"Unknown artifact_mode={artifact_mode!r}")
     if artifact_mode == "full" and lora_rank != 0:
         raise ValueError(f"Full artifact must have lora_rank=0, got {lora_rank}")
+    if artifact_mode == "full" and lora_freeze_a:
+        raise ValueError("Full artifact must have lora_freeze_a=False")
     if artifact_mode == "lora" and lora_rank < 1:
         raise ValueError(f"LoRA artifact must have lora_rank>=1, got {lora_rank}")
     if h.seed != init_seed:
         log(f"deserialize: using artifact init_seed={init_seed} instead of current SEED={h.seed}")
     if h.lora_rank != lora_rank:
         log(f"deserialize: using artifact lora_rank={lora_rank} instead of current LORA_RANK={h.lora_rank}")
+    if h.lora_freeze_a != lora_freeze_a:
+        log(
+            f"deserialize: using artifact lora_freeze_a={lora_freeze_a} "
+            f"instead of current LORA_FREEZE_A={h.lora_freeze_a}"
+        )
     return {
         "artifact_mode": artifact_mode,
         "init_seed": init_seed,
         "lora_rank": lora_rank,
+        "lora_freeze_a": lora_freeze_a,
     }
 
 
@@ -1360,6 +1398,7 @@ def deserialize(h: Hyperparameters, device: torch.device) -> GPT:
         h,
         seed=artifact_meta["init_seed"],
         lora_rank=artifact_meta["lora_rank"],
+        lora_freeze_a=artifact_meta["lora_freeze_a"],
     )
 
     if artifact_meta["artifact_mode"] == "full":
@@ -1374,6 +1413,7 @@ def deserialize(h: Hyperparameters, device: torch.device) -> GPT:
         device,
         init_seed=artifact_meta["init_seed"],
         lora_rank=artifact_meta["lora_rank"],
+        lora_freeze_a=artifact_meta["lora_freeze_a"],
     )
     compact_template = state_dict_to_cpu(build_serializable_state_dict(lora_model))
     deq_state = dequantize_mixed(quant_state["w"], quant_state["m"], compact_template)
@@ -1650,7 +1690,7 @@ def train_model(h: Hyperparameters, device: torch.device, val_data: ValidationDa
     lora_params = get_lora_parameter_count(base_model)
     log(
         f"model_params:{total_params} trainable_params:{trainable_params} "
-        f"lora_rank:{h.lora_rank} lora_params:{lora_params}"
+        f"lora_rank:{h.lora_rank} lora_freeze_a:{h.lora_freeze_a} lora_params:{lora_params}"
     )
     optimizers = Optimizers(h, base_model)
     train_loader = ShuffledSequenceLoader(h, device)
