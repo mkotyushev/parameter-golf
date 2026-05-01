@@ -48,6 +48,11 @@ TTT_LR=0.005
 TTT_EPOCHS=3
 ```
 
+`MAX_TRAIN_STEPS=N` optionally stops the main training loop after `N` optimizer
+steps. It combines with `MAX_WALLCLOCK_SECONDS`, and training exits when either
+cap is reached. Use `MAX_WALLCLOCK_SECONDS=0 MAX_TRAIN_STEPS=N` for a
+step-only cap.
+
 ## Serialization
 
 When LoRA is disabled, serialization follows the inherited full-state path.

@@ -242,6 +242,7 @@ class Hyperparameters:
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 500))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 6e2))
+    max_train_steps = int(os.environ.get("MAX_TRAIN_STEPS", 0))
     val_batch_tokens = int(os.environ.get("VAL_BATCH_TOKENS", 524288))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 2048))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 4000))
@@ -3503,11 +3504,14 @@ def train_model(h, device, val_data):
     max_wallclock_ms = (
         1e3 * h.max_wallclock_seconds if h.max_wallclock_seconds > 0 else None
     )
+    max_train_steps = h.max_train_steps if h.max_train_steps > 0 else None
     if max_wallclock_ms is not None:
         max_wallclock_ms -= h.gptq_reserve_seconds * 1e3
         log(
             f"gptq:reserving {h.gptq_reserve_seconds:.1f}s, effective={max_wallclock_ms:.0f}ms"
         )
+    if max_train_steps is not None:
+        log(f"train_step_cap: {max_train_steps}")
 
     def training_frac(step, elapsed_ms):
         if max_wallclock_ms is None:
@@ -3623,6 +3627,7 @@ def train_model(h, device, val_data):
     ema_decay = h.ema_decay
     training_time_ms = 0.0
     stop_after_step = None
+    stop_reason = None
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     step = 0
@@ -3649,7 +3654,8 @@ def train_model(h, device, val_data):
         if last_step:
             if stop_after_step is not None and step < h.iterations:
                 log(
-                    f"stopping_early: wallclock_cap train_time: {training_time_ms:.0f}ms step: {step}/{h.iterations}"
+                    f"stopping_early: {stop_reason or 'early_cap'} "
+                    f"train_time: {training_time_ms:.0f}ms step: {step}/{h.iterations}"
                 )
             break
         elapsed_ms = training_time_ms + 1e3 * (time.perf_counter() - t0)
@@ -3680,15 +3686,22 @@ def train_model(h, device, val_data):
             log(
                 f"{step}/{h.iterations} train_loss: {train_loss.item():.4f} train_time: {approx_training_time_ms/60000:.1f}m tok/s: {tok_per_sec:.0f}"
             )
-        reached_cap = (
+        reached_wallclock_cap = (
             max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
         )
         if h.distributed and max_wallclock_ms is not None:
-            reached_cap_tensor = torch.tensor(int(reached_cap), device=device)
-            dist.all_reduce(reached_cap_tensor, op=dist.ReduceOp.MAX)
-            reached_cap = bool(reached_cap_tensor.item())
-        if stop_after_step is None and reached_cap:
+            reached_wallclock_cap_tensor = torch.tensor(int(reached_wallclock_cap), device=device)
+            dist.all_reduce(reached_wallclock_cap_tensor, op=dist.ReduceOp.MAX)
+            reached_wallclock_cap = bool(reached_wallclock_cap_tensor.item())
+        reached_step_cap = max_train_steps is not None and step >= max_train_steps
+        if stop_after_step is None and (reached_wallclock_cap or reached_step_cap):
             stop_after_step = step
+            stop_reasons = []
+            if reached_wallclock_cap:
+                stop_reasons.append("wallclock_cap")
+            if reached_step_cap:
+                stop_reasons.append("train_step_cap")
+            stop_reason = "+".join(stop_reasons)
     log(
         f"peak memory allocated: {torch.cuda.max_memory_allocated()//1024//1024} MiB reserved: {torch.cuda.max_memory_reserved()//1024//1024} MiB"
     )
