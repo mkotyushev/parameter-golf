@@ -11,7 +11,7 @@ the frozen base model from initialization during serialization.
 
 1. **Inherited SP8192 Base** - starts from the 2026-04-09 architecture: SP8192 tokenizer, depth recurrence, parallel residuals, QK gain, tied embeddings, GPTQ, and legal score-first TTT.
 2. **Train-Time LoRA** - optional `LORA_RANK` inserts LoRA adapters around `CastedLinear` modules. Base linear weights are frozen, while LoRA adapters and non-linear/control tensors remain trainable.
-3. **Frozen-A Mode** - optional `LORA_FREEZE_A=1` freezes the randomly initialized LoRA A matrices so they can be reconstructed from the initialization seed instead of stored.
+3. **Frozen-A Mode** - optional `LORA_FREEZE_A=1` freezes the randomly initialized LoRA A matrices so they can be reconstructed from the initialization seed instead of stored. `LORA_A_INIT=orthogonal` can make those frozen A rows orthogonal instead of Kaiming-uniform.
 4. **Compact Artifact Mode** - LoRA artifacts store only non-reconstructible tensors. Frozen base weights, biases, and optionally frozen LoRA A tensors are rebuilt from the seed at deserialize time.
 5. **Fused Eval Weights** - deserialization rebuilds the LoRA model, fuses each low-rank delta into its base weight, and loads the fused state into a plain non-LoRA model for validation and TTT.
 6. **LoRA-Aware GPTQ** - LoRA tensors use a separate smaller GPTQ threshold so large adapter matrices can be quantized instead of being forced through the regular full-model threshold.
@@ -39,6 +39,8 @@ Useful knobs:
 ```bash
 LORA_RANK=384
 LORA_FREEZE_A=1
+LORA_A_INIT=kaiming
+LORA_A_ORTHO_GAIN=0.5773502691896258
 MODEL_DIM=768
 EMBEDDING_DIM=768
 MLP_MULT=4.3333333333
@@ -53,14 +55,30 @@ steps. It combines with `MAX_WALLCLOCK_SECONDS`, and training exits when either
 cap is reached. Use `MAX_WALLCLOCK_SECONDS=0 MAX_TRAIN_STEPS=N` for a
 step-only cap.
 
+Recommended LoRA-A conditioning ablation:
+
+```bash
+# Baseline: current behavior
+LORA_A_INIT=kaiming
+
+# Test: orthogonal rows with Kaiming-matched row norm
+LORA_A_INIT=orthogonal
+LORA_A_ORTHO_GAIN=0.5773502691896258
+
+# Optional stronger test: unit-row orthonormal A
+LORA_A_INIT=orthogonal
+LORA_A_ORTHO_GAIN=1.0
+```
+
 ## Serialization
 
 When LoRA is disabled, serialization follows the inherited full-state path.
 
 When LoRA is enabled, the artifact metadata records `artifact_mode`, `init_seed`,
-`lora_rank`, and `lora_freeze_a`. Deserialization uses those fields to rebuild
-the matching initialized model, load the compact adapter state, fuse LoRA deltas
-into regular weights, and evaluate with a plain model state dict.
+`lora_rank`, `lora_freeze_a`, `lora_a_init`, and `lora_a_ortho_gain`.
+Deserialization uses those fields to rebuild the matching initialized model,
+load the compact adapter state, fuse LoRA deltas into regular weights, and
+evaluate with a plain model state dict.
 
 ## GPTQ
 
@@ -85,6 +103,8 @@ MATCHED_FINEWEB_REPO_ID=kevclark/parameter-golf python3 data/cached_challenge_fi
 SEED=42 \
 LORA_RANK=384 \
 LORA_FREEZE_A=1 \
+LORA_A_INIT=orthogonal \
+LORA_A_ORTHO_GAIN=0.5773502691896258 \
 MODEL_DIM=768 \
 EMBEDDING_DIM=768 \
 MLP_MULT=4.3333333333 \

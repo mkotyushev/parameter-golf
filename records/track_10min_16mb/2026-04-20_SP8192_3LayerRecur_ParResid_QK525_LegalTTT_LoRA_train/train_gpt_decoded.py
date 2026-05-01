@@ -27,6 +27,40 @@ from flash_attn_interface import flash_attn_func as flash_attn_3_func
 COMPILE_ENABLED_ENV = bool(int(os.environ.get("COMPILE_ENABLED", "1")))
 GPTQ_MIN_NUMEL = 65536
 LORA_GPTQ_MIN_NUMEL = 32768
+LORA_A_ORTHO_GAIN_DEFAULT = 1.0 / math.sqrt(3.0)
+
+
+def _normalize_lora_a_init(value: str) -> str:
+    value = str(value).strip().lower()
+    if value not in {"kaiming", "orthogonal"}:
+        raise ValueError(f"LORA_A_INIT must be 'kaiming' or 'orthogonal', got {value!r}")
+    return value
+
+
+def _validate_lora_a_ortho_gain(value: float) -> float:
+    value = float(value)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError(f"LORA_A_ORTHO_GAIN must be finite and > 0, got {value}")
+    return value
+
+
+def _init_lora_a(
+    tensor: Tensor,
+    a_init: str,
+    a_ortho_gain: float,
+    generator: torch.Generator | None = None,
+) -> None:
+    a_init = _normalize_lora_a_init(a_init)
+    a_ortho_gain = _validate_lora_a_ortho_gain(a_ortho_gain)
+    if a_init == "kaiming":
+        nn.init.kaiming_uniform_(tensor, a=math.sqrt(5), generator=generator)
+        return
+    if tensor.shape[-2] > tensor.shape[-1]:
+        raise ValueError(
+            "LORA_A_INIT=orthogonal requires rank <= in_features, "
+            f"got rank={tensor.shape[-2]} in_features={tensor.shape[-1]}"
+        )
+    nn.init.orthogonal_(tensor, gain=a_ortho_gain, generator=generator)
 
 
 class Hyperparameters:
@@ -66,6 +100,8 @@ class Hyperparameters:
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 5.0))
     lora_rank = int(os.environ.get("LORA_RANK", 0))
     lora_freeze_a = bool(int(os.environ.get("LORA_FREEZE_A", "0")))
+    lora_a_init = os.environ.get("LORA_A_INIT", "kaiming")
+    lora_a_ortho_gain = float(os.environ.get("LORA_A_ORTHO_GAIN", LORA_A_ORTHO_GAIN_DEFAULT))
     compile_enabled = bool(int(os.environ.get("COMPILE_ENABLED", "1")))
 
     num_loops = int(os.environ.get("NUM_LOOPS", 2))
@@ -328,7 +364,15 @@ class CastedLinear(nn.Linear):
 
 
 class LoRALinear(nn.Module):
-    def __init__(self, linear: CastedLinear, rank: int, generator: torch.Generator, freeze_a: bool = False):
+    def __init__(
+        self,
+        linear: CastedLinear,
+        rank: int,
+        generator: torch.Generator,
+        freeze_a: bool = False,
+        a_init: str = "kaiming",
+        a_ortho_gain: float = LORA_A_ORTHO_GAIN_DEFAULT,
+    ):
         super().__init__()
         if not isinstance(linear, nn.Linear):
             raise TypeError(f"Expected nn.Linear, got {type(linear).__name__}")
@@ -338,6 +382,8 @@ class LoRALinear(nn.Module):
         self.out_features = linear.out_features
         self.rank = rank
         self.freeze_a = freeze_a
+        self.a_init = _normalize_lora_a_init(a_init)
+        self.a_ortho_gain = _validate_lora_a_ortho_gain(a_ortho_gain)
         self.scaling = 1.0
         self.weight = linear.weight
         self.bias = linear.bias
@@ -346,7 +392,7 @@ class LoRALinear(nn.Module):
             self.bias.requires_grad = False
         self.lora_A = nn.Parameter(self.weight.new_empty((rank, self.in_features)))
         self.lora_B = nn.Parameter(self.weight.new_zeros((self.out_features, rank)))
-        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5), generator=generator)
+        _init_lora_a(self.lora_A, self.a_init, self.a_ortho_gain, generator=generator)
         nn.init.zeros_(self.lora_B)
         if self.freeze_a:
             self.lora_A.requires_grad = False
@@ -357,7 +403,9 @@ class LoRALinear(nn.Module):
             f"out_features={self.out_features}, "
             f"bias={self.bias is not None}, "
             f"rank={self.rank}, "
-            f"freeze_a={self.freeze_a}"
+            f"freeze_a={self.freeze_a}, "
+            f"a_init={self.a_init}, "
+            f"a_ortho_gain={self.a_ortho_gain}"
         )
 
     def fused_weight(self) -> Tensor:
@@ -715,14 +763,34 @@ def replace_casted_linear_with_lora(
     rank: int,
     generator: torch.Generator,
     freeze_a: bool = False,
+    a_init: str = "kaiming",
+    a_ortho_gain: float = LORA_A_ORTHO_GAIN_DEFAULT,
 ) -> nn.Module:
     for name, child in list(module.named_children()):
         if isinstance(child, LoRALinear):
             continue
         if isinstance(child, CastedLinear):
-            setattr(module, name, LoRALinear(child, rank=rank, generator=generator, freeze_a=freeze_a))
+            setattr(
+                module,
+                name,
+                LoRALinear(
+                    child,
+                    rank=rank,
+                    generator=generator,
+                    freeze_a=freeze_a,
+                    a_init=a_init,
+                    a_ortho_gain=a_ortho_gain,
+                ),
+            )
             continue
-        replace_casted_linear_with_lora(child, rank=rank, generator=generator, freeze_a=freeze_a)
+        replace_casted_linear_with_lora(
+            child,
+            rank=rank,
+            generator=generator,
+            freeze_a=freeze_a,
+            a_init=a_init,
+            a_ortho_gain=a_ortho_gain,
+        )
     return module
 
 
@@ -748,10 +816,14 @@ def build_model(
     init_seed: int | None = None,
     lora_rank: int | None = None,
     lora_freeze_a: bool | None = None,
+    lora_a_init: str | None = None,
+    lora_a_ortho_gain: float | None = None,
 ) -> GPT:
     init_seed = h.seed if init_seed is None else init_seed
     lora_rank = h.lora_rank if lora_rank is None else lora_rank
     lora_freeze_a = h.lora_freeze_a if lora_freeze_a is None else lora_freeze_a
+    lora_a_init = h.lora_a_init if lora_a_init is None else lora_a_init
+    lora_a_ortho_gain = h.lora_a_ortho_gain if lora_a_ortho_gain is None else lora_a_ortho_gain
     rng_state = snapshot_rng_state()
     try:
         seed_all(init_seed)
@@ -764,6 +836,8 @@ def build_model(
                 rank=lora_rank,
                 generator=lora_generator,
                 freeze_a=lora_freeze_a,
+                a_init=lora_a_init,
+                a_ortho_gain=lora_a_ortho_gain,
             )
         return model
     finally:
@@ -1305,6 +1379,12 @@ def build_artifact_meta(h: Hyperparameters, model: nn.Module) -> dict[str, objec
         "init_seed": h.seed,
         "lora_rank": lora_rank,
         "lora_freeze_a": lora_freeze_a,
+        "lora_a_init": _normalize_lora_a_init(h.lora_a_init) if artifact_mode == "lora" else "kaiming",
+        "lora_a_ortho_gain": (
+            _validate_lora_a_ortho_gain(h.lora_a_ortho_gain)
+            if artifact_mode == "lora"
+            else LORA_A_ORTHO_GAIN_DEFAULT
+        ),
     }
 
 
@@ -1362,11 +1442,17 @@ def _resolve_artifact_meta(h: Hyperparameters, quant_state: dict[str, object]) -
             "init_seed": h.seed,
             "lora_rank": 0,
             "lora_freeze_a": False,
+            "lora_a_init": "kaiming",
+            "lora_a_ortho_gain": LORA_A_ORTHO_GAIN_DEFAULT,
         }
     artifact_mode = artifact_meta.get("artifact_mode", "full")
     init_seed = int(artifact_meta.get("init_seed", h.seed))
     lora_rank = int(artifact_meta.get("lora_rank", 0))
     lora_freeze_a = bool(artifact_meta.get("lora_freeze_a", False))
+    lora_a_init = _normalize_lora_a_init(artifact_meta.get("lora_a_init", "kaiming"))
+    lora_a_ortho_gain = _validate_lora_a_ortho_gain(
+        artifact_meta.get("lora_a_ortho_gain", LORA_A_ORTHO_GAIN_DEFAULT)
+    )
     if artifact_mode not in {"full", "lora"}:
         raise ValueError(f"Unknown artifact_mode={artifact_mode!r}")
     if artifact_mode == "full" and lora_rank != 0:
@@ -1384,11 +1470,20 @@ def _resolve_artifact_meta(h: Hyperparameters, quant_state: dict[str, object]) -
             f"deserialize: using artifact lora_freeze_a={lora_freeze_a} "
             f"instead of current LORA_FREEZE_A={h.lora_freeze_a}"
         )
+    if _normalize_lora_a_init(h.lora_a_init) != lora_a_init:
+        log(f"deserialize: using artifact lora_a_init={lora_a_init} instead of current LORA_A_INIT={h.lora_a_init}")
+    if _validate_lora_a_ortho_gain(h.lora_a_ortho_gain) != lora_a_ortho_gain:
+        log(
+            f"deserialize: using artifact lora_a_ortho_gain={lora_a_ortho_gain} "
+            f"instead of current LORA_A_ORTHO_GAIN={h.lora_a_ortho_gain}"
+        )
     return {
         "artifact_mode": artifact_mode,
         "init_seed": init_seed,
         "lora_rank": lora_rank,
         "lora_freeze_a": lora_freeze_a,
+        "lora_a_init": lora_a_init,
+        "lora_a_ortho_gain": lora_a_ortho_gain,
     }
 
 
@@ -1400,6 +1495,8 @@ def deserialize(h: Hyperparameters, device: torch.device) -> GPT:
         seed=artifact_meta["init_seed"],
         lora_rank=artifact_meta["lora_rank"],
         lora_freeze_a=artifact_meta["lora_freeze_a"],
+        lora_a_init=artifact_meta["lora_a_init"],
+        lora_a_ortho_gain=artifact_meta["lora_a_ortho_gain"],
     )
 
     if artifact_meta["artifact_mode"] == "full":
@@ -1415,6 +1512,8 @@ def deserialize(h: Hyperparameters, device: torch.device) -> GPT:
         init_seed=artifact_meta["init_seed"],
         lora_rank=artifact_meta["lora_rank"],
         lora_freeze_a=artifact_meta["lora_freeze_a"],
+        lora_a_init=artifact_meta["lora_a_init"],
+        lora_a_ortho_gain=artifact_meta["lora_a_ortho_gain"],
     )
     compact_template = state_dict_to_cpu(build_serializable_state_dict(lora_model))
     deq_state = dequantize_mixed(quant_state["w"], quant_state["m"], compact_template)
@@ -1691,7 +1790,9 @@ def train_model(h: Hyperparameters, device: torch.device, val_data: ValidationDa
     lora_params = get_lora_parameter_count(base_model)
     log(
         f"model_params:{total_params} trainable_params:{trainable_params} "
-        f"lora_rank:{h.lora_rank} lora_freeze_a:{h.lora_freeze_a} lora_params:{lora_params}"
+        f"lora_rank:{h.lora_rank} lora_freeze_a:{h.lora_freeze_a} "
+        f"lora_a_init:{h.lora_a_init} lora_a_ortho_gain:{h.lora_a_ortho_gain} "
+        f"lora_params:{lora_params}"
     )
     optimizers = Optimizers(h, base_model)
     train_loader = ShuffledSequenceLoader(h, device)
@@ -1914,6 +2015,8 @@ def main() -> None:
     h = Hyperparameters()
     if h.lora_rank < 0:
         raise ValueError(f"LORA_RANK must be >= 0, got {h.lora_rank}")
+    h.lora_a_init = _normalize_lora_a_init(h.lora_a_init)
+    h.lora_a_ortho_gain = _validate_lora_a_ortho_gain(h.lora_a_ortho_gain)
     set_logging_hparams(h)
     if h.is_main_process:
         os.makedirs("logs", exist_ok=True)

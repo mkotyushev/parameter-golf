@@ -12,7 +12,7 @@ SOTA code while keeping the existing phased eval-time TTT LoRA path intact.
 1. **Inherited SmearGate SOTA Base** - starts from the 2026-04-29 3-seed compliance reproduction of PR #1851: SmearGate BOS fix, CaseOps SP8192, LQER asymmetric quantization, sparse attention gate, fused softcapped CE, and phased TTT.
 2. **Banked Train-Time LoRA** - optional `LORA_RANK` adds low-rank adapters over the banked model matrices: `qo_bank`, `kv_bank`, `mlp_up_bank`, and `mlp_down_bank`.
 3. **Frozen Base Banks** - when train-time LoRA is enabled, the base bank tensors are frozen and only adapter matrices plus the normal scalar/control tensors remain trainable.
-4. **Frozen-A Mode** - optional `LORA_FREEZE_A=1` freezes the randomly initialized LoRA A matrices so they can be reconstructed from the initialization seed instead of stored.
+4. **Frozen-A Mode** - optional `LORA_FREEZE_A=1` freezes the randomly initialized LoRA A matrices so they can be reconstructed from the initialization seed instead of stored. `LORA_A_INIT=orthogonal` can make those frozen A rows orthogonal instead of Kaiming-uniform.
 5. **Compact Artifact Mode** - LoRA artifacts store adapter B tensors, optionally trainable adapter A tensors, and non-reconstructible non-bank tensors. Base bank weights are rebuilt from seed at deserialize time.
 6. **Fused Eval Weights** - deserialization rebuilds the LoRA model, fuses low-rank deltas into the four bank tensors, and loads the fused state into a plain non-LoRA model for post-quant eval and phased TTT.
 7. **LoRA-Aware GPTQ** - LoRA tensors use `LORA_GPTQ_MIN_NUMEL`, while inherited full-model tensors use the regular `GPTQ_MIN_NUMEL` threshold.
@@ -46,6 +46,8 @@ Useful knobs:
 ```bash
 LORA_RANK=384
 LORA_FREEZE_A=1
+LORA_A_INIT=kaiming
+LORA_A_ORTHO_GAIN=0.5773502691896258
 CASEOPS_ENABLED=1
 EMBED_BITS=7
 SMEAR_GATE_ENABLED=1
@@ -62,14 +64,30 @@ steps. It combines with `MAX_WALLCLOCK_SECONDS`, and training exits when either
 cap is reached. Use `MAX_WALLCLOCK_SECONDS=0 MAX_TRAIN_STEPS=N` for a
 step-only cap.
 
+Recommended LoRA-A conditioning ablation:
+
+```bash
+# Baseline: current behavior
+LORA_A_INIT=kaiming
+
+# Test: orthogonal rows with Kaiming-matched row norm
+LORA_A_INIT=orthogonal
+LORA_A_ORTHO_GAIN=0.5773502691896258
+
+# Optional stronger test: unit-row orthonormal A
+LORA_A_INIT=orthogonal
+LORA_A_ORTHO_GAIN=1.0
+```
+
 ## Serialization
 
 When LoRA is disabled, serialization follows the inherited full-state path.
 
 When LoRA is enabled, artifact metadata records `artifact_mode`, `init_seed`,
-`lora_rank`, and `lora_freeze_a`. Deserialization uses those fields to rebuild
-the matching initialized model, load the compact adapter state, fuse the LoRA
-deltas into the bank tensors, and evaluate with a plain model state dict.
+`lora_rank`, `lora_freeze_a`, `lora_a_init`, and `lora_a_ortho_gain`.
+Deserialization uses those fields to rebuild the matching initialized model,
+load the compact adapter state, fuse the LoRA deltas into the bank tensors, and
+evaluate with a plain model state dict.
 
 ## GPTQ
 
@@ -98,6 +116,8 @@ python3 prepare_caseops_data.py
 SEED=42 \
 LORA_RANK=384 \
 LORA_FREEZE_A=1 \
+LORA_A_INIT=orthogonal \
+LORA_A_ORTHO_GAIN=0.5773502691896258 \
 CASEOPS_ENABLED=1 \
 EMBED_BITS=7 \
 SMEAR_GATE_ENABLED=1 \

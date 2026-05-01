@@ -14,6 +14,42 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 GPTQ_MIN_NUMEL = 65536
 LORA_GPTQ_MIN_NUMEL = 32768
+LORA_A_ORTHO_GAIN_DEFAULT = 1.0 / math.sqrt(3.0)
+
+
+def _normalize_lora_a_init(value):
+    value = str(value).strip().lower()
+    if value not in {"kaiming", "orthogonal"}:
+        raise ValueError(f"LORA_A_INIT must be 'kaiming' or 'orthogonal', got {value!r}")
+    return value
+
+
+def _validate_lora_a_ortho_gain(value):
+    value = float(value)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError(f"LORA_A_ORTHO_GAIN must be finite and > 0, got {value}")
+    return value
+
+
+def _init_lora_a(tensor, a_init, a_ortho_gain):
+    a_init = _normalize_lora_a_init(a_init)
+    a_ortho_gain = _validate_lora_a_ortho_gain(a_ortho_gain)
+    if a_init == "kaiming":
+        nn.init.kaiming_uniform_(tensor, a=math.sqrt(5))
+        return
+    if tensor.shape[-2] > tensor.shape[-1]:
+        raise ValueError(
+            "LORA_A_INIT=orthogonal requires rank <= in_features, "
+            f"got rank={tensor.shape[-2]} in_features={tensor.shape[-1]}"
+        )
+    if tensor.ndim == 2:
+        nn.init.orthogonal_(tensor, gain=a_ortho_gain)
+        return
+    if tensor.ndim == 3:
+        for i in range(tensor.shape[0]):
+            nn.init.orthogonal_(tensor[i], gain=a_ortho_gain)
+        return
+    raise ValueError(f"Expected LoRA A tensor to be 2D or 3D, got shape={tuple(tensor.shape)}")
 
 
 # ===== Fused softcapped cross-entropy (Triton) — training-only path =====
@@ -264,6 +300,8 @@ class Hyperparameters:
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 5.0))
     lora_rank = int(os.environ.get("LORA_RANK", 0))
     lora_freeze_a = bool(int(os.environ.get("LORA_FREEZE_A", "0")))
+    lora_a_init = os.environ.get("LORA_A_INIT", "kaiming")
+    lora_a_ortho_gain = float(os.environ.get("LORA_A_ORTHO_GAIN", LORA_A_ORTHO_GAIN_DEFAULT))
     num_loops = int(os.environ.get("NUM_LOOPS", 2))
     loop_start = int(os.environ.get("LOOP_START", 3))
     loop_end = int(os.environ.get("LOOP_END", 5))
@@ -1146,7 +1184,7 @@ class Block(nn.Module):
 
 
 class BankedLoRA(nn.Module):
-    def __init__(self, weight, rank, freeze_a=False):
+    def __init__(self, weight, rank, freeze_a=False, a_init="kaiming", a_ortho_gain=LORA_A_ORTHO_GAIN_DEFAULT):
         super().__init__()
         if weight.ndim != 3:
             raise ValueError(f"BankedLoRA expects a 3D bank, got shape={tuple(weight.shape)}")
@@ -1155,16 +1193,22 @@ class BankedLoRA(nn.Module):
         num_weights, out_features, in_features = weight.shape
         self.rank = rank
         self.freeze_a = bool(freeze_a)
+        self.a_init = _normalize_lora_a_init(a_init)
+        self.a_ortho_gain = _validate_lora_a_ortho_gain(a_ortho_gain)
         self.scaling = 1.0
         self.lora_A = nn.Parameter(weight.new_empty(num_weights, rank, in_features))
         self.lora_B = nn.Parameter(weight.new_zeros(num_weights, out_features, rank))
-        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        _init_lora_a(self.lora_A, self.a_init, self.a_ortho_gain)
         nn.init.zeros_(self.lora_B)
         if self.freeze_a:
             self.lora_A.requires_grad = False
 
     def extra_repr(self):
-        return f"rank={self.rank}, freeze_a={self.freeze_a}, scaling={self.scaling}"
+        return (
+            f"rank={self.rank}, freeze_a={self.freeze_a}, "
+            f"a_init={self.a_init}, a_ortho_gain={self.a_ortho_gain}, "
+            f"scaling={self.scaling}"
+        )
 
     def delta(self):
         return torch.bmm(self.lora_B, self.lora_A) * self.scaling
@@ -1286,16 +1330,26 @@ class GPT(nn.Module):
             self.smear_lambda = nn.Parameter(torch.zeros(1, dtype=torch.float32))
         self.lora_rank = int(getattr(h, "lora_rank", 0))
         self.lora_freeze_a = bool(getattr(h, "lora_freeze_a", False))
+        self.lora_a_init = _normalize_lora_a_init(getattr(h, "lora_a_init", "kaiming"))
+        self.lora_a_ortho_gain = _validate_lora_a_ortho_gain(
+            getattr(h, "lora_a_ortho_gain", LORA_A_ORTHO_GAIN_DEFAULT)
+        )
         self.qo_lora = None
         self.kv_lora = None
         self.mlp_up_lora = None
         self.mlp_down_lora = None
         self._init_weights()
         if self.lora_rank > 0:
-            self.qo_lora = BankedLoRA(self.qo_bank, self.lora_rank, freeze_a=self.lora_freeze_a)
-            self.kv_lora = BankedLoRA(self.kv_bank, self.lora_rank, freeze_a=self.lora_freeze_a)
-            self.mlp_up_lora = BankedLoRA(self.mlp_up_bank, self.lora_rank, freeze_a=self.lora_freeze_a)
-            self.mlp_down_lora = BankedLoRA(self.mlp_down_bank, self.lora_rank, freeze_a=self.lora_freeze_a)
+            lora_kwargs = {
+                "rank": self.lora_rank,
+                "freeze_a": self.lora_freeze_a,
+                "a_init": self.lora_a_init,
+                "a_ortho_gain": self.lora_a_ortho_gain,
+            }
+            self.qo_lora = BankedLoRA(self.qo_bank, **lora_kwargs)
+            self.kv_lora = BankedLoRA(self.kv_bank, **lora_kwargs)
+            self.mlp_up_lora = BankedLoRA(self.mlp_up_bank, **lora_kwargs)
+            self.mlp_down_lora = BankedLoRA(self.mlp_down_bank, **lora_kwargs)
             for bank in (self.qo_bank, self.kv_bank, self.mlp_up_bank, self.mlp_down_bank):
                 bank.requires_grad_(False)
 
@@ -2205,13 +2259,25 @@ def clone_hparams(h, **updates):
     return cloned
 
 
-def build_model(h, device, init_seed=None, lora_rank=None, lora_freeze_a=None):
+def build_model(
+    h,
+    device,
+    init_seed=None,
+    lora_rank=None,
+    lora_freeze_a=None,
+    lora_a_init=None,
+    lora_a_ortho_gain=None,
+):
     init_seed = h.seed if init_seed is None else init_seed
     model_h = clone_hparams(h)
     if lora_rank is not None:
         model_h.lora_rank = lora_rank
     if lora_freeze_a is not None:
         model_h.lora_freeze_a = lora_freeze_a
+    if lora_a_init is not None:
+        model_h.lora_a_init = lora_a_init
+    if lora_a_ortho_gain is not None:
+        model_h.lora_a_ortho_gain = lora_a_ortho_gain
     rng_state = snapshot_rng_state()
     try:
         seed_all(init_seed)
@@ -2729,6 +2795,12 @@ def build_artifact_meta(h, model):
         "init_seed": h.seed,
         "lora_rank": get_train_lora_rank(model) if artifact_mode == "lora" else 0,
         "lora_freeze_a": get_train_lora_freeze_a(model) if artifact_mode == "lora" else False,
+        "lora_a_init": _normalize_lora_a_init(h.lora_a_init) if artifact_mode == "lora" else "kaiming",
+        "lora_a_ortho_gain": (
+            _validate_lora_a_ortho_gain(h.lora_a_ortho_gain)
+            if artifact_mode == "lora"
+            else LORA_A_ORTHO_GAIN_DEFAULT
+        ),
     }
 
 
@@ -2740,12 +2812,18 @@ def _resolve_artifact_meta(h, quant_state):
             "init_seed": h.seed,
             "lora_rank": 0,
             "lora_freeze_a": False,
+            "lora_a_init": "kaiming",
+            "lora_a_ortho_gain": LORA_A_ORTHO_GAIN_DEFAULT,
         },
     )
     artifact_mode = artifact_meta.get("artifact_mode", "full")
     init_seed = int(artifact_meta.get("init_seed", h.seed))
     lora_rank = int(artifact_meta.get("lora_rank", 0))
     lora_freeze_a = bool(artifact_meta.get("lora_freeze_a", False))
+    lora_a_init = _normalize_lora_a_init(artifact_meta.get("lora_a_init", "kaiming"))
+    lora_a_ortho_gain = _validate_lora_a_ortho_gain(
+        artifact_meta.get("lora_a_ortho_gain", LORA_A_ORTHO_GAIN_DEFAULT)
+    )
     if artifact_mode not in {"full", "lora"}:
         raise ValueError(f"Unknown artifact_mode={artifact_mode!r}")
     if artifact_mode == "full" and lora_rank != 0:
@@ -2763,11 +2841,20 @@ def _resolve_artifact_meta(h, quant_state):
             f"deserialize: using artifact lora_freeze_a={lora_freeze_a} "
             f"instead of current LORA_FREEZE_A={h.lora_freeze_a}"
         )
+    if _normalize_lora_a_init(h.lora_a_init) != lora_a_init:
+        log(f"deserialize: using artifact lora_a_init={lora_a_init} instead of current LORA_A_INIT={h.lora_a_init}")
+    if _validate_lora_a_ortho_gain(h.lora_a_ortho_gain) != lora_a_ortho_gain:
+        log(
+            f"deserialize: using artifact lora_a_ortho_gain={lora_a_ortho_gain} "
+            f"instead of current LORA_A_ORTHO_GAIN={h.lora_a_ortho_gain}"
+        )
     return {
         "artifact_mode": artifact_mode,
         "init_seed": init_seed,
         "lora_rank": lora_rank,
         "lora_freeze_a": lora_freeze_a,
+        "lora_a_init": lora_a_init,
+        "lora_a_ortho_gain": lora_a_ortho_gain,
     }
 
 
@@ -2830,6 +2917,8 @@ def deserialize(h, device):
         seed=artifact_meta["init_seed"],
         lora_rank=artifact_meta["lora_rank"],
         lora_freeze_a=artifact_meta["lora_freeze_a"],
+        lora_a_init=artifact_meta["lora_a_init"],
+        lora_a_ortho_gain=artifact_meta["lora_a_ortho_gain"],
     )
     if artifact_meta["artifact_mode"] == "full":
         eval_model = build_model(artifact_h, device, init_seed=artifact_meta["init_seed"], lora_rank=0)
@@ -2850,6 +2939,8 @@ def deserialize(h, device):
         init_seed=artifact_meta["init_seed"],
         lora_rank=artifact_meta["lora_rank"],
         lora_freeze_a=artifact_meta["lora_freeze_a"],
+        lora_a_init=artifact_meta["lora_a_init"],
+        lora_a_ortho_gain=artifact_meta["lora_a_ortho_gain"],
     )
     compact_template = _unbank_state_dict(build_serializable_state_dict(lora_model), artifact_h.num_layers)
     deq_state = dequantize_mixed(quant_state["w"], quant_state["m"], compact_template)
@@ -3497,7 +3588,9 @@ def train_model(h, device, val_data):
     lora_params = get_train_lora_parameter_count(base_model)
     log(
         f"model_params:{total_params} trainable_params:{trainable_params} "
-        f"lora_rank:{h.lora_rank} lora_freeze_a:{h.lora_freeze_a} lora_params:{lora_params}"
+        f"lora_rank:{h.lora_rank} lora_freeze_a:{h.lora_freeze_a} "
+        f"lora_a_init:{h.lora_a_init} lora_a_ortho_gain:{h.lora_a_ortho_gain} "
+        f"lora_params:{lora_params}"
     )
     optimizers = Optimizers(h, base_model)
     train_loader = DocumentPackingLoader(h, device)
@@ -3905,6 +3998,8 @@ def main():
     h = Hyperparameters()
     if h.lora_rank < 0:
         raise ValueError(f"LORA_RANK must be >= 0, got {h.lora_rank}")
+    h.lora_a_init = _normalize_lora_a_init(h.lora_a_init)
+    h.lora_a_ortho_gain = _validate_lora_a_ortho_gain(h.lora_a_ortho_gain)
     set_logging_hparams(h)
     if h.is_main_process:
         os.makedirs(h.artifact_dir if h.artifact_dir else "logs", exist_ok=True)
