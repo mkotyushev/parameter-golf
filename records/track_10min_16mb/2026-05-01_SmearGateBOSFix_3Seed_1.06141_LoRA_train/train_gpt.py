@@ -12,6 +12,10 @@ import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 
+GPTQ_MIN_NUMEL = 65536
+LORA_GPTQ_MIN_NUMEL = 32768
+
+
 # ===== Fused softcapped cross-entropy (Triton) — training-only path =====
 # Replaces the eager
 #     logits_softcap = softcap * tanh(logits / softcap)
@@ -257,6 +261,8 @@ class Hyperparameters:
     rope_yarn = bool(int(os.environ.get("ROPE_YARN", "0")))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 5.0))
+    lora_rank = int(os.environ.get("LORA_RANK", 0))
+    lora_freeze_a = bool(int(os.environ.get("LORA_FREEZE_A", "0")))
     num_loops = int(os.environ.get("NUM_LOOPS", 2))
     loop_start = int(os.environ.get("LOOP_START", 3))
     loop_end = int(os.environ.get("LOOP_END", 5))
@@ -1137,6 +1143,35 @@ class Block(nn.Module):
         ] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor, up_w, down_w)
         return x_out
 
+
+class BankedLoRA(nn.Module):
+    def __init__(self, weight, rank, freeze_a=False):
+        super().__init__()
+        if weight.ndim != 3:
+            raise ValueError(f"BankedLoRA expects a 3D bank, got shape={tuple(weight.shape)}")
+        if rank < 1:
+            raise ValueError(f"LORA_RANK must be >= 1, got {rank}")
+        num_weights, out_features, in_features = weight.shape
+        self.rank = rank
+        self.freeze_a = bool(freeze_a)
+        self.scaling = 1.0
+        self.lora_A = nn.Parameter(weight.new_empty(num_weights, rank, in_features))
+        self.lora_B = nn.Parameter(weight.new_zeros(num_weights, out_features, rank))
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B)
+        if self.freeze_a:
+            self.lora_A.requires_grad = False
+
+    def extra_repr(self):
+        return f"rank={self.rank}, freeze_a={self.freeze_a}, scaling={self.scaling}"
+
+    def delta(self):
+        return torch.bmm(self.lora_B, self.lora_A) * self.scaling
+
+    def apply_to(self, weight, index):
+        return weight[index] + (self.lora_B[index] @ self.lora_A[index]) * self.scaling
+
+
 class GPT(nn.Module):
     def __init__(self, h):
         super().__init__()
@@ -1248,7 +1283,20 @@ class GPT(nn.Module):
             self.smear_gate = CastedLinear(self.smear_window, 1, bias=False)
             self.smear_gate._zero_init = True
             self.smear_lambda = nn.Parameter(torch.zeros(1, dtype=torch.float32))
+        self.lora_rank = int(getattr(h, "lora_rank", 0))
+        self.lora_freeze_a = bool(getattr(h, "lora_freeze_a", False))
+        self.qo_lora = None
+        self.kv_lora = None
+        self.mlp_up_lora = None
+        self.mlp_down_lora = None
         self._init_weights()
+        if self.lora_rank > 0:
+            self.qo_lora = BankedLoRA(self.qo_bank, self.lora_rank, freeze_a=self.lora_freeze_a)
+            self.kv_lora = BankedLoRA(self.kv_bank, self.lora_rank, freeze_a=self.lora_freeze_a)
+            self.mlp_up_lora = BankedLoRA(self.mlp_up_bank, self.lora_rank, freeze_a=self.lora_freeze_a)
+            self.mlp_down_lora = BankedLoRA(self.mlp_down_bank, self.lora_rank, freeze_a=self.lora_freeze_a)
+            for bank in (self.qo_bank, self.kv_bank, self.mlp_up_bank, self.mlp_down_bank):
+                bank.requires_grad_(False)
 
     def _init_weights(self):
         if self.tie_embeddings:
@@ -1278,14 +1326,20 @@ class GPT(nn.Module):
 
     def _bank_weights(self, i):
         n = self.num_layers
-        return (
-            self.qo_bank[i],
-            self.kv_bank[i],
-            self.kv_bank[n + i],
-            self.qo_bank[n + i],
-            self.mlp_up_bank[i],
-            self.mlp_down_bank[i],
-        )
+        q_w = self.qo_bank[i]
+        k_w = self.kv_bank[i]
+        v_w = self.kv_bank[n + i]
+        out_w = self.qo_bank[n + i]
+        up_w = self.mlp_up_bank[i]
+        down_w = self.mlp_down_bank[i]
+        if self.qo_lora is not None:
+            q_w = self.qo_lora.apply_to(self.qo_bank, i)
+            out_w = self.qo_lora.apply_to(self.qo_bank, n + i)
+            k_w = self.kv_lora.apply_to(self.kv_bank, i)
+            v_w = self.kv_lora.apply_to(self.kv_bank, n + i)
+            up_w = self.mlp_up_lora.apply_to(self.mlp_up_bank, i)
+            down_w = self.mlp_down_lora.apply_to(self.mlp_down_bank, i)
+        return q_w, k_w, v_w, out_w, up_w, down_w
 
     def _parallel_block(
         self, block_idx, lane0, lane1, x0,
@@ -1713,6 +1767,48 @@ class BatchedTTTLoRA(nn.Module):
                         lora.reset()
 
 
+def iter_train_lora_modules(model):
+    return (module for module in model.modules() if isinstance(module, BankedLoRA))
+
+
+def has_train_lora(model):
+    return any(True for _ in iter_train_lora_modules(model))
+
+
+def get_train_lora_rank(model):
+    for module in iter_train_lora_modules(model):
+        return module.rank
+    return 0
+
+
+def get_train_lora_freeze_a(model):
+    freeze_settings = {module.freeze_a for module in iter_train_lora_modules(model)}
+    if len(freeze_settings) > 1:
+        raise ValueError(f"Expected uniform LORA_FREEZE_A, got {sorted(freeze_settings)}")
+    return next(iter(freeze_settings), False)
+
+
+def get_train_lora_parameter_count(model):
+    return sum(p.numel() for name, p in model.named_parameters() if is_train_lora_tensor_name(name))
+
+
+def is_train_lora_tensor_name(name):
+    return "_lora.lora_" in name
+
+
+def gptq_min_numel_for_name(name):
+    return LORA_GPTQ_MIN_NUMEL if is_train_lora_tensor_name(name) else GPTQ_MIN_NUMEL
+
+
+def should_gptq_named_tensor(name, tensor):
+    if not tensor.is_floating_point():
+        return False
+    threshold = gptq_min_numel_for_name(name)
+    if is_train_lora_tensor_name(name):
+        return tensor.numel() >= threshold
+    return tensor.numel() > threshold
+
+
 # Polar Express per-iteration minimax Newton-Schulz coefficients (PR #1344).
 # Replaces the fixed (3.4445, -4.775, 2.0315) coefficients of stock Muon.
 # Applied at backend_steps=5 — taking more than 5 iterations from this list
@@ -1902,65 +1998,101 @@ PACKED_REPLICATED_GRAD_MAX_NUMEL = 1 << 15
 class Optimizers:
     def __init__(self, h, base_model):
         matrix_params = [
-            base_model.qo_bank,
-            base_model.kv_bank,
-            base_model.mlp_up_bank,
-            base_model.mlp_down_bank,
+            p
+            for p in (
+                base_model.qo_bank,
+                base_model.kv_bank,
+                base_model.mlp_up_bank,
+                base_model.mlp_down_bank,
+            )
+            if p.requires_grad
         ]
+        matrix_params.extend(
+            p
+            for module in iter_train_lora_modules(base_model)
+            for p in module.parameters()
+            if p.requires_grad
+        )
         block_named_params = list(base_model.blocks.named_parameters())
         scalar_params = [
             p
             for (name, p) in block_named_params
-            if p.ndim < 2
-            or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+            if p.requires_grad
+            and (
+                p.ndim < 2
+                or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+            )
         ]
-        if base_model.skip_weights.numel() > 0:
+        if base_model.skip_weights.numel() > 0 and base_model.skip_weights.requires_grad:
             scalar_params.append(base_model.skip_weights)
-        if base_model.skip_gates is not None and base_model.skip_gates.numel() > 0:
+        if (
+            base_model.skip_gates is not None
+            and base_model.skip_gates.numel() > 0
+            and base_model.skip_gates.requires_grad
+        ):
             scalar_params.append(base_model.skip_gates)
-        if base_model.parallel_post_lambdas is not None:
+        if base_model.parallel_post_lambdas is not None and base_model.parallel_post_lambdas.requires_grad:
             scalar_params.append(base_model.parallel_post_lambdas)
-        if base_model.parallel_resid_lambdas is not None:
+        if base_model.parallel_resid_lambdas is not None and base_model.parallel_resid_lambdas.requires_grad:
             scalar_params.append(base_model.parallel_resid_lambdas)
         # SmearGate params live on GPT root (not in .blocks), so add them by hand.
         # Both are tiny (gate_window scalars + 1 lambda). Optimized via scalar Adam.
         if getattr(base_model, "smear_gate_enabled", False):
-            scalar_params.append(base_model.smear_gate.weight)
-            scalar_params.append(base_model.smear_lambda)
+            if base_model.smear_gate.weight.requires_grad:
+                scalar_params.append(base_model.smear_gate.weight)
+            if base_model.smear_lambda.requires_grad:
+                scalar_params.append(base_model.smear_lambda)
         token_lr = h.tied_embed_lr if h.tie_embeddings else h.embed_lr
         tok_params = [
             {"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}
-        ]
-        self.optimizer_tok = torch.optim.AdamW(
-            tok_params,
-            betas=(h.beta1, h.beta2),
-            eps=h.adam_eps,
-            weight_decay=h.embed_wd,
-            fused=True,
+        ] if base_model.tok_emb.weight.requires_grad else []
+        self.optimizer_tok = (
+            torch.optim.AdamW(
+                tok_params,
+                betas=(h.beta1, h.beta2),
+                eps=h.adam_eps,
+                weight_decay=h.embed_wd,
+                fused=True,
+            )
+            if tok_params
+            else None
         )
-        self.optimizer_muon = Muon(
-            matrix_params,
-            lr=h.matrix_lr,
-            momentum=h.muon_momentum,
-            backend_steps=h.muon_backend_steps,
-            weight_decay=h.muon_wd,
-            row_normalize=h.muon_row_normalize,
+        self.optimizer_muon = (
+            Muon(
+                matrix_params,
+                lr=h.matrix_lr,
+                momentum=h.muon_momentum,
+                backend_steps=h.muon_backend_steps,
+                weight_decay=h.muon_wd,
+                row_normalize=h.muon_row_normalize,
+            )
+            if matrix_params
+            else None
         )
-        for group in self.optimizer_muon.param_groups:
-            group["base_lr"] = h.matrix_lr
-        self.optimizer_scalar = torch.optim.AdamW(
-            [{"params": scalar_params, "lr": h.scalar_lr, "base_lr": h.scalar_lr}],
-            betas=(h.beta1, h.beta2),
-            eps=h.adam_eps,
-            weight_decay=h.adam_wd,
-            fused=True,
+        if self.optimizer_muon is not None:
+            for group in self.optimizer_muon.param_groups:
+                group["base_lr"] = h.matrix_lr
+        self.optimizer_scalar = (
+            torch.optim.AdamW(
+                [{"params": scalar_params, "lr": h.scalar_lr, "base_lr": h.scalar_lr}],
+                betas=(h.beta1, h.beta2),
+                eps=h.adam_eps,
+                weight_decay=h.adam_wd,
+                fused=True,
+            )
+            if scalar_params
+            else None
         )
         self.optimizers = [
-            self.optimizer_tok,
-            self.optimizer_muon,
-            self.optimizer_scalar,
+            opt
+            for opt in (
+                self.optimizer_tok,
+                self.optimizer_muon,
+                self.optimizer_scalar,
+            )
+            if opt is not None
         ]
-        self.replicated_params = list(tok_params[0]["params"])
+        self.replicated_params = list(tok_params[0]["params"]) if tok_params else []
         self.replicated_params.extend(scalar_params)
         self.replicated_large_params = []
         self.replicated_packed_params = []
@@ -2001,7 +2133,8 @@ class Optimizers:
                 offset += n
 
     def step(self, distributed=False):
-        self.optimizer_muon.launch_reduce_scatters()
+        if self.optimizer_muon is not None:
+            self.optimizer_muon.launch_reduce_scatters()
         if distributed:
             reduce_handles = [
                 dist.all_reduce(p.grad, op=dist.ReduceOp.AVG, async_op=True)
@@ -2011,15 +2144,18 @@ class Optimizers:
             self._all_reduce_packed_grads()
             for handle in reduce_handles:
                 handle.wait()
-        self.optimizer_tok.step()
-        self.optimizer_scalar.step()
-        self.optimizer_muon.step()
+        if self.optimizer_tok is not None:
+            self.optimizer_tok.step()
+        if self.optimizer_scalar is not None:
+            self.optimizer_scalar.step()
+        if self.optimizer_muon is not None:
+            self.optimizer_muon.step()
         self.zero_grad_all()
 
 
 def restore_fp32_params(model):
     for module in model.modules():
-        if isinstance(module, CastedLinear):
+        if isinstance(module, (CastedLinear, BankedLoRA)):
             module.float()
     for name, param in model.named_parameters():
         if (
@@ -2034,6 +2170,57 @@ def restore_fp32_params(model):
     model.mlp_down_bank.data = model.mlp_down_bank.data.float()
 
 
+def seed_all(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def snapshot_rng_state():
+    state = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.random.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def restore_rng_state(state):
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.random.set_rng_state(state["torch"])
+    if "cuda" in state and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state["cuda"])
+
+
+def clone_hparams(h, **updates):
+    cloned = copy.copy(h)
+    for key, value in updates.items():
+        setattr(cloned, key, value)
+    return cloned
+
+
+def build_model(h, device, init_seed=None, lora_rank=None, lora_freeze_a=None):
+    init_seed = h.seed if init_seed is None else init_seed
+    model_h = clone_hparams(h)
+    if lora_rank is not None:
+        model_h.lora_rank = lora_rank
+    if lora_freeze_a is not None:
+        model_h.lora_freeze_a = lora_freeze_a
+    rng_state = snapshot_rng_state()
+    try:
+        seed_all(init_seed)
+        model = GPT(model_h).to(device).bfloat16()
+        restore_fp32_params(model)
+        return model
+    finally:
+        restore_rng_state(rng_state)
+
+
 def collect_hessians(model, train_loader, h, device, n_calibration_batches=64):
     hessians = {}
     hooks = []
@@ -2042,53 +2229,59 @@ def collect_hessians(model, train_loader, h, device, n_calibration_batches=64):
         block.mlp._calib = True
         block.mlp.use_fused = False
 
+    def flatten_input(x):
+        x = x.detach().float()
+        if x.ndim == 3:
+            x = x.reshape(-1, x.shape[-1])
+        return x
+
+    def add_hessian(name, x):
+        if name not in hessians:
+            hessians[name] = torch.zeros(
+                x.shape[1], x.shape[1], dtype=torch.float32, device=device
+            )
+        hessians[name].addmm_(x.T, x)
+
+    def add_lora_hessians(name, lora, slot, x):
+        if lora is None:
+            return
+        x = flatten_input(x)
+        if not lora.freeze_a and should_gptq_named_tensor(f"{name}.lora_A", lora.lora_A):
+            add_hessian(f"{name}.lora_A", x)
+        if should_gptq_named_tensor(f"{name}.lora_B", lora.lora_B):
+            projected = F.linear(x, lora.lora_A[slot].detach().float())
+            add_hessian(f"{name}.lora_B", projected)
+
     def make_attn_hook(layer_idx):
         def hook_fn(module, inp, out):
-            x = inp[0].detach().float()
-            if x.ndim == 3:
-                x = x.reshape(-1, x.shape[-1])
+            x = flatten_input(inp[0])
             for suffix in ["c_q", "c_k", "c_v"]:
                 name = f"blocks.{layer_idx}.attn.{suffix}.weight"
-                if name not in hessians:
-                    hessians[name] = torch.zeros(
-                        x.shape[1], x.shape[1], dtype=torch.float32, device=device
-                    )
-                hessians[name].addmm_(x.T, x)
+                add_hessian(name, x)
+            n_layers = model.num_layers
+            add_lora_hessians("qo_lora", model.qo_lora, layer_idx, x)
+            add_lora_hessians("kv_lora", model.kv_lora, layer_idx, x)
+            add_lora_hessians("kv_lora", model.kv_lora, n_layers + layer_idx, x)
             y = module._last_proj_input
             if y is not None:
-                y = y.float()
-                if y.ndim == 3:
-                    y = y.reshape(-1, y.shape[-1])
+                y = flatten_input(y)
                 name = f"blocks.{layer_idx}.attn.proj.weight"
-                if name not in hessians:
-                    hessians[name] = torch.zeros(
-                        y.shape[1], y.shape[1], dtype=torch.float32, device=device
-                    )
-                hessians[name].addmm_(y.T, y)
+                add_hessian(name, y)
+                add_lora_hessians("qo_lora", model.qo_lora, n_layers + layer_idx, y)
         return hook_fn
 
     def make_mlp_hook(layer_idx):
         def hook_fn(module, inp, out):
-            x = inp[0].detach().float()
-            if x.ndim == 3:
-                x = x.reshape(-1, x.shape[-1])
+            x = flatten_input(inp[0])
             name = f"blocks.{layer_idx}.mlp.fc.weight"
-            if name not in hessians:
-                hessians[name] = torch.zeros(
-                    x.shape[1], x.shape[1], dtype=torch.float32, device=device
-                )
-            hessians[name].addmm_(x.T, x)
+            add_hessian(name, x)
+            add_lora_hessians("mlp_up_lora", model.mlp_up_lora, layer_idx, x)
             h_act = module._last_down_input
             if h_act is not None:
-                h_act = h_act.float()
-                if h_act.ndim == 3:
-                    h_act = h_act.reshape(-1, h_act.shape[-1])
+                h_act = flatten_input(h_act)
                 name = f"blocks.{layer_idx}.mlp.proj.weight"
-                if name not in hessians:
-                    hessians[name] = torch.zeros(
-                        h_act.shape[1], h_act.shape[1], dtype=torch.float32, device=device
-                    )
-                hessians[name].addmm_(h_act.T, h_act)
+                add_hessian(name, h_act)
+                add_lora_hessians("mlp_down_lora", model.mlp_down_lora, layer_idx, h_act)
         return hook_fn
 
     for i, block in enumerate(model.blocks):
@@ -2143,7 +2336,8 @@ def collect_hessians(model, train_loader, h, device, n_calibration_batches=64):
 
 
 def gptq_quantize_weight(w, H, clip_sigmas=3.0, clip_range=63, block_size=128):
-    W_orig = w.float().clone()
+    original_shape = tuple(w.shape)
+    W_orig = w.float().reshape(-1, w.shape[-1]).clone()
     rows, cols = W_orig.shape
     H = H.float().clone()
     dead = torch.diag(H) == 0
@@ -2177,7 +2371,9 @@ def gptq_quantize_weight(w, H, clip_sigmas=3.0, clip_range=63, block_size=128):
             W_block[:, j:] -= err.unsqueeze(1) * Hinv_block[j, j:].unsqueeze(0)
         if i2 < cols:
             W_work[:, i2:] -= Err @ Hinv[i1:i2, i2:]
-    return Q[:, invperm], s
+    q_shape = original_shape
+    scale_shape = original_shape[:-1]
+    return Q[:, invperm].reshape(q_shape), s.reshape(scale_shape)
 
 
 def _quantize_gate_int8_row(w):
@@ -2242,9 +2438,13 @@ def gptq_mixed_quantize(state_dict, hessians, h):
             result[name + ".gs"] = gs
             meta[name] = "gate_int8_row"
             continue
-        if not t.is_floating_point() or t.numel() <= 65536:
+        if not should_gptq_named_tensor(name, t):
             result[name] = t.to(torch.float16) if t.is_floating_point() else t
             meta[name] = "passthrough (float16)"
+            continue
+        if name not in hessians:
+            result[name] = t.to(torch.float16)
+            meta[name] = "passthrough (float16, no_hessian)"
             continue
         if "tok_emb" in name:
             cs = h.embed_clip_sigmas
@@ -2263,8 +2463,8 @@ def gptq_mixed_quantize(state_dict, hessians, h):
         result[name + ".q"] = q
         result[name + ".scale"] = s
         meta[name] = f"gptq (int{bits})"
-        if lqer_on:
-            W_q = q.float() * s.float().view(-1, 1)
+        if lqer_on and t.ndim == 2:
+            W_q = q.float() * s.float().view(q.shape[0], 1)
             E = t.float() - W_q
             lqer_cands[name] = (E, float(E.norm()))
     if lqer_on and lqer_cands:
@@ -2322,7 +2522,7 @@ def dequantize_mixed(result, meta, template_sd):
             continue
         q, s = result[name + ".q"], result[name + ".scale"]
         if s.ndim > 0:
-            W = q.float() * s.float().view(q.shape[0], *[1] * (q.ndim - 1))
+            W = q.float() * s.float().view(*s.shape, *[1] * (q.ndim - s.ndim))
         else:
             W = q.float() * float(s.item())
         if "lqer_asym" in info:
@@ -2470,15 +2670,119 @@ def _compressed_code_size(code):
     return len(code_raw), len(wrapper)
 
 
+def get_reconstructible_tensor_names(model):
+    if not has_train_lora(model):
+        return set()
+    names = {"qo_bank", "kv_bank", "mlp_up_bank", "mlp_down_bank"}
+    if get_train_lora_freeze_a(model):
+        names.update(
+            f"{module_name}.lora_A"
+            for module_name, module in model.named_modules()
+            if isinstance(module, BankedLoRA)
+        )
+    return names
+
+
+def build_compact_state_dict(model):
+    reconstructible = get_reconstructible_tensor_names(model)
+    return collections.OrderedDict(
+        (name, tensor)
+        for name, tensor in model.state_dict().items()
+        if name not in reconstructible
+    )
+
+
+def build_serializable_state_dict(model):
+    if has_train_lora(model):
+        return build_compact_state_dict(model)
+    return collections.OrderedDict((name, tensor) for name, tensor in model.state_dict().items())
+
+
+def state_dict_to_cpu(state_dict):
+    return {name: tensor.detach().cpu() for name, tensor in state_dict.items()}
+
+
+def build_fused_state_dict(model):
+    fused = collections.OrderedDict()
+    lora_by_bank = {
+        "qo_bank": model.qo_lora,
+        "kv_bank": model.kv_lora,
+        "mlp_up_bank": model.mlp_up_lora,
+        "mlp_down_bank": model.mlp_down_lora,
+    }
+    for name, tensor in model.state_dict().items():
+        if is_train_lora_tensor_name(name):
+            continue
+        lora = lora_by_bank.get(name)
+        if lora is not None:
+            fused[name] = (tensor + lora.delta().to(dtype=tensor.dtype)).detach().clone()
+        else:
+            fused[name] = tensor.detach().clone()
+    return fused
+
+
+def build_artifact_meta(h, model):
+    artifact_mode = "lora" if has_train_lora(model) else "full"
+    return {
+        "artifact_mode": artifact_mode,
+        "init_seed": h.seed,
+        "lora_rank": get_train_lora_rank(model) if artifact_mode == "lora" else 0,
+        "lora_freeze_a": get_train_lora_freeze_a(model) if artifact_mode == "lora" else False,
+    }
+
+
+def _resolve_artifact_meta(h, quant_state):
+    artifact_meta = quant_state.get(
+        "artifact_meta",
+        {
+            "artifact_mode": "full",
+            "init_seed": h.seed,
+            "lora_rank": 0,
+            "lora_freeze_a": False,
+        },
+    )
+    artifact_mode = artifact_meta.get("artifact_mode", "full")
+    init_seed = int(artifact_meta.get("init_seed", h.seed))
+    lora_rank = int(artifact_meta.get("lora_rank", 0))
+    lora_freeze_a = bool(artifact_meta.get("lora_freeze_a", False))
+    if artifact_mode not in {"full", "lora"}:
+        raise ValueError(f"Unknown artifact_mode={artifact_mode!r}")
+    if artifact_mode == "full" and lora_rank != 0:
+        raise ValueError(f"Full artifact must have lora_rank=0, got {lora_rank}")
+    if artifact_mode == "full" and lora_freeze_a:
+        raise ValueError("Full artifact must have lora_freeze_a=False")
+    if artifact_mode == "lora" and lora_rank < 1:
+        raise ValueError(f"LoRA artifact must have lora_rank>=1, got {lora_rank}")
+    if h.seed != init_seed:
+        log(f"deserialize: using artifact init_seed={init_seed} instead of current SEED={h.seed}")
+    if h.lora_rank != lora_rank:
+        log(f"deserialize: using artifact lora_rank={lora_rank} instead of current LORA_RANK={h.lora_rank}")
+    if h.lora_freeze_a != lora_freeze_a:
+        log(
+            f"deserialize: using artifact lora_freeze_a={lora_freeze_a} "
+            f"instead of current LORA_FREEZE_A={h.lora_freeze_a}"
+        )
+    return {
+        "artifact_mode": artifact_mode,
+        "init_seed": init_seed,
+        "lora_rank": lora_rank,
+        "lora_freeze_a": lora_freeze_a,
+    }
+
+
 def serialize(h, base_model, code):
     code_bytes_uncompressed, code_bytes = _compressed_code_size(code)
+    serializable_state = build_serializable_state_dict(base_model)
     if h.is_main_process:
-        torch.save(base_model.state_dict(), h.model_path)
+        torch.save(serializable_state, h.model_path)
         model_bytes = os.path.getsize(h.model_path)
         log(f"Serialized model: {model_bytes} bytes")
         log(f"Code size (uncompressed): {code_bytes_uncompressed} bytes")
         log(f"Code size (compressed): {code_bytes} bytes")
-    sd_cpu = _unbank_state_dict(base_model.state_dict(), h.num_layers)
+        if has_train_lora(base_model):
+            omitted = len(get_reconstructible_tensor_names(base_model))
+            log(f"LoRA artifact mode: compact ({omitted} reconstructible tensors omitted)")
+    sd_cpu = _unbank_state_dict(serializable_state, h.num_layers)
     device = torch.device("cuda", h.local_rank)
     t0 = time.perf_counter()
     calib_loader = ShuffledSequenceLoader(h, device)
@@ -2495,7 +2799,10 @@ def serialize(h, base_model, code):
     quant_result, quant_meta = gptq_mixed_quantize(sd_cpu, hessians, h)
     log(f"GPTQ:quantized in {time.perf_counter()-t_quant:.1f}s")
     quant_buf = io.BytesIO()
-    torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
+    torch.save(
+        {"w": quant_result, "m": quant_meta, "artifact_meta": build_artifact_meta(h, base_model)},
+        quant_buf,
+    )
     quant_raw = quant_buf.getvalue()
     t_compress = time.perf_counter()
     quant_blob = _compress(quant_raw, h.compressor)
@@ -2511,20 +2818,52 @@ def serialize(h, base_model, code):
 
 
 def deserialize(h, device):
-    eval_model = GPT(h).to(device).bfloat16()
-    restore_fp32_params(eval_model)
-    flat_template = _unbank_state_dict(eval_model.state_dict(), h.num_layers)
     with open(h.quantized_model_path, "rb") as f:
         quant_blob_disk = f.read()
     quant_state = torch.load(
         io.BytesIO(_decompress(quant_blob_disk, h.compressor)), map_location="cpu"
     )
-    deq_flat = dequantize_mixed(quant_state["w"], quant_state["m"], flat_template)
-    head_dim = h.model_dim // h.num_heads
-    kv_dim = h.num_kv_heads * head_dim
-    hidden_dim = int(h.mlp_mult * h.model_dim)
-    deq_state = _rebank_state_dict(deq_flat, h.num_layers, h.model_dim, kv_dim, hidden_dim)
-    eval_model.load_state_dict(deq_state, strict=True)
+    artifact_meta = _resolve_artifact_meta(h, quant_state)
+    artifact_h = clone_hparams(
+        h,
+        seed=artifact_meta["init_seed"],
+        lora_rank=artifact_meta["lora_rank"],
+        lora_freeze_a=artifact_meta["lora_freeze_a"],
+    )
+    if artifact_meta["artifact_mode"] == "full":
+        eval_model = build_model(artifact_h, device, init_seed=artifact_meta["init_seed"], lora_rank=0)
+        flat_template = _unbank_state_dict(eval_model.state_dict(), artifact_h.num_layers)
+        deq_flat = dequantize_mixed(quant_state["w"], quant_state["m"], flat_template)
+        head_dim = artifact_h.model_dim // artifact_h.num_heads
+        kv_dim = artifact_h.num_kv_heads * head_dim
+        hidden_dim = int(artifact_h.mlp_mult * artifact_h.model_dim)
+        deq_state = _rebank_state_dict(
+            deq_flat, artifact_h.num_layers, artifact_h.model_dim, kv_dim, hidden_dim
+        )
+        eval_model.load_state_dict(deq_state, strict=True)
+        return eval_model
+
+    lora_model = build_model(
+        artifact_h,
+        device,
+        init_seed=artifact_meta["init_seed"],
+        lora_rank=artifact_meta["lora_rank"],
+        lora_freeze_a=artifact_meta["lora_freeze_a"],
+    )
+    compact_template = _unbank_state_dict(build_serializable_state_dict(lora_model), artifact_h.num_layers)
+    deq_state = dequantize_mixed(quant_state["w"], quant_state["m"], compact_template)
+    missing_keys, unexpected_keys = lora_model.load_state_dict(deq_state, strict=False)
+    expected_missing = get_reconstructible_tensor_names(lora_model)
+    if unexpected_keys or set(missing_keys) != expected_missing:
+        raise RuntimeError(
+            "LoRA artifact load mismatch: "
+            f"missing={sorted(missing_keys)} unexpected={sorted(unexpected_keys)} "
+            f"expected_missing={sorted(expected_missing)}"
+        )
+    fused_state = build_fused_state_dict(lora_model)
+    plain_h = clone_hparams(artifact_h, lora_rank=0, lora_freeze_a=False)
+    eval_model = build_model(plain_h, device, init_seed=artifact_meta["init_seed"], lora_rank=0)
+    eval_model.load_state_dict(fused_state, strict=True)
     return eval_model
 
 
@@ -3146,14 +3485,19 @@ def timed_eval(label, fn, *args, **kwargs):
 
 
 def train_model(h, device, val_data):
-    base_model = GPT(h).to(device).bfloat16()
-    restore_fp32_params(base_model)
+    base_model = build_model(h, device)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     compiled_forward_logits = torch.compile(
         base_model.forward_logits, dynamic=False, fullgraph=True
     )
     model = compiled_model
-    log(f"model_params:{sum(p.numel()for p in base_model.parameters())}")
+    total_params = sum(p.numel() for p in base_model.parameters())
+    trainable_params = sum(p.numel() for p in base_model.parameters() if p.requires_grad)
+    lora_params = get_train_lora_parameter_count(base_model)
+    log(
+        f"model_params:{total_params} trainable_params:{trainable_params} "
+        f"lora_rank:{h.lora_rank} lora_freeze_a:{h.lora_freeze_a} lora_params:{lora_params}"
+    )
     optimizers = Optimizers(h, base_model)
     train_loader = DocumentPackingLoader(h, device)
     max_wallclock_ms = (
@@ -3197,8 +3541,9 @@ def train_model(h, device, val_data):
         muon_momentum = (
             1 - frac
         ) * h.muon_momentum_warmup_start + frac * h.muon_momentum
-        for group in optimizers.optimizer_muon.param_groups:
-            group["momentum"] = muon_momentum
+        if optimizers.optimizer_muon is not None:
+            for group in optimizers.optimizer_muon.param_groups:
+                group["momentum"] = muon_momentum
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * lr_scale
@@ -3357,10 +3702,7 @@ def train_model(h, device, val_data):
 
 
 def train_and_eval(h, device):
-    random.seed(h.seed)
-    np.random.seed(h.seed)
-    torch.manual_seed(h.seed)
-    torch.cuda.manual_seed_all(h.seed)
+    seed_all(h.seed)
     if h.artifact_dir and h.is_main_process:
         os.makedirs(h.artifact_dir, exist_ok=True)
     val_data = ValidationData(h, device)
@@ -3548,6 +3890,8 @@ def main():
     torch._dynamo.config.optimize_ddp = False
     torch._dynamo.config.cache_size_limit = 16
     h = Hyperparameters()
+    if h.lora_rank < 0:
+        raise ValueError(f"LORA_RANK must be >= 0, got {h.lora_rank}")
     set_logging_hparams(h)
     if h.is_main_process:
         os.makedirs(h.artifact_dir if h.artifact_dir else "logs", exist_ok=True)
